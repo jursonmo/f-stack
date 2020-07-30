@@ -16,7 +16,8 @@ TARGET="helloworld"
 all:
 	cc -O -gdwarf-2  -I../lib -o ${TARGET} main.c ${LIBS}
 	cc -O -gdwarf-2  -I../lib -o ${TARGET}_epoll main_epoll.c ${LIBS}
-
+	cc -O -gdwarf-2  -I../lib -o ${TARGET}_client main_client.c ${LIBS}
+	cc -O -gdwarf-2  -I../lib -o ${TARGET}_kni main_kni.c ${LIBS} -I${FF_DPDK}/include
 .PHONY: clean
 clean:
-	rm -f *.o ${TARGET} ${TARGET}_epoll
+	rm -f *.o ${TARGET} ${TARGET}_epoll ${TARGET}_client ${TARGET}_kni
