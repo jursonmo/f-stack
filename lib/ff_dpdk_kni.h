@@ -55,5 +55,15 @@ enum FilterReturn ff_kni_proto_filter(const void *data, uint16_t len, uint16_t e
 
 int ff_kni_enqueue(uint16_t port_id, struct rte_mbuf *pkt);
 
+//start mykni 
+void ff_init_mykni(void);
+int ff_mykni_env();
+int ff_mykni_alloc();
+int ff_sendto_mykni(char *buf, int len);
+int ff_flush_mykni();
+int ff_mykni_txbuf_len();
+int ff_mykni_read(char *buf, int cap);
+int ff_mykni_read_multi(char **buf, int nb, int cap);
+// end of mykni
 
 #endif /* ifndef _FSTACK_DPDK_KNI_H */

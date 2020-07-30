@@ -569,3 +569,289 @@ ff_kni_enqueue(uint16_t port_id, struct rte_mbuf *pkt)
     return 0;
 }
 
+
+//---------------------------mykni-----------------------
+/* kni device statistics array */
+static struct kni_interface_stats kni_stats[RTE_MAX_ETHPORTS];
+/* Max size of a single packet */
+#define MAX_PACKET_SZ           2048
+
+/* Size of the data buffer in each mbuf */
+#define MBUF_DATA_SZ (MAX_PACKET_SZ + RTE_PKTMBUF_HEADROOM)
+
+/* Number of mbufs in mempool that is created */
+//#define NB_MBUF                 (8192 * 16)
+#define NB_MBUF                 (8192 * 1)
+
+/* How many packets to attempt to read from NIC in one go */
+#define PKT_BURST_SZ            32
+
+/* How many objects (mbufs) to keep in per-lcore mempool cache */
+#define MEMPOOL_CACHE_SZ        PKT_BURST_SZ
+
+#define KNI_MAX_KTHREAD 32
+/*
+ * Structure of port parameters
+ */
+struct kni_port_params {
+	uint16_t port_id;/* Port ID */
+	unsigned lcore_rx; /* lcore ID for RX */
+	unsigned lcore_tx; /* lcore ID for TX */
+	uint32_t nb_lcore_k; /* Number of lcores for KNI multi kernel threads */
+	uint32_t nb_kni; /* Number of KNI devices to be created */
+	unsigned lcore_k[KNI_MAX_KTHREAD]; /* lcore ID list for kthreads */
+	struct rte_kni *kni[KNI_MAX_KTHREAD]; /* KNI context pointers */
+} __rte_cache_aligned;
+
+/* Mempool for mbufs */
+//extern struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
+static struct rte_mempool *pktmbuf_pool[RTE_MAX_ETHPORTS];
+static struct kni_port_params *kni_port_params_array[RTE_MAX_ETHPORTS];
+int port_id = 0;
+struct rte_mbuf *pkts_burst_tx[PKT_BURST_SZ];
+struct rte_mbuf *pkts_burst_rx[PKT_BURST_SZ];
+int nb_tx = 0;
+int nb_rx = 0;
+int rx_index = 0;
+
+
+/* Initialize KNI subsystem */
+void
+ff_init_mykni(void)
+{
+    /*
+	unsigned int num_of_kni_ports = 0, i;
+	struct kni_port_params **params = kni_port_params_array;
+
+	// Calculate the maximum number of KNI interfaces that will be used 
+	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
+		if (kni_port_params_array[i]) {
+			num_of_kni_ports += (params[i]->nb_lcore_k ?
+				params[i]->nb_lcore_k : 1);
+		}
+	}
+    */
+	/* Invoke rte KNI init to preallocate the ports */
+    unsigned int num_of_kni_ports = 0;
+	rte_kni_init(num_of_kni_ports);
+}
+
+int
+ff_mykni_env() { 
+    char s[64] = {0};
+    unsigned int socketid;
+    void *b = NULL;
+    struct kni_port_params *c;
+    struct rte_mbuf *mb;
+    memset(&kni_port_params_array, 0, sizeof(kni_port_params_array));
+    printf("RTE_MAX_ETHPORTS =%d , port_id=%d\n", RTE_MAX_ETHPORTS, port_id);
+    
+	b = rte_zmalloc("KNI_port_params",
+				    sizeof(struct kni_port_params), RTE_CACHE_LINE_SIZE);
+    if (!b) {
+        rte_exit(EXIT_FAILURE, "Could not rte_zmalloc KNI_port_params\n");
+        return -1;
+    }
+
+    kni_port_params_array[port_id] = (struct kni_port_params*)b;                         
+    kni_port_params_array[port_id]->port_id = (uint16_t)port_id;
+
+    socketid = rte_socket_id();
+    printf("start rte_pktmbuf_pool_create, socket=%d\n", socketid);
+    snprintf(s, sizeof(s), "mbuf_pool_mykni_%d", socketid);
+    if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+         /* Create the mbuf pool */        
+        pktmbuf_pool[port_id] = rte_pktmbuf_pool_create(s, NB_MBUF,
+            MEMPOOL_CACHE_SZ, 0, MBUF_DATA_SZ, socketid);
+
+        if (rte_mempool_lookup(s)!= pktmbuf_pool[port_id]){
+            rte_exit(EXIT_FAILURE, "Could not initialise mbuf pool:%s\n", s);
+            return -1;
+	    }
+    } else {
+        pktmbuf_pool[port_id] = rte_mempool_lookup(s);
+    }   
+	if (pktmbuf_pool[port_id] == NULL) {
+		rte_exit(EXIT_FAILURE, "Could not initialise mbuf pool\n");
+		return -1;
+	}
+
+    //testing
+    mb = rte_mbuf_raw_alloc(pktmbuf_pool[port_id]);
+    //mb = rte_pktmbuf_alloc(pktmbuf_pool[port_id]);
+    if (!mb) {
+        rte_exit(EXIT_FAILURE, "Could not alloc mbuf from pool\n");
+		return -1;
+    }
+    printf("mb: pkt_len:%d, data_len:%d, data_off:%d, buf_len:%d \n", mb->pkt_len, mb->data_len, mb->data_off, mb->buf_len);
+    //output: mb: pkt_len:0, data_len:0, data_off:128, buf_len:2176
+    rte_pktmbuf_free(mb);
+
+    kni_stats[port_id].rx_packets = 0;
+    kni_stats[port_id].rx_dropped = 0;
+    kni_stats[port_id].tx_packets = 0;
+    kni_stats[port_id].tx_dropped = 0;
+    return 0;
+}
+
+int ff_mykni_alloc()
+{
+	uint8_t i = 0;
+	struct rte_kni *kni;
+	struct rte_kni_conf conf;
+    struct kni_port_params **params = kni_port_params_array;
+    struct rte_kni_ops ops;
+    
+    snprintf(conf.name, RTE_KNI_NAMESIZE,
+					"moveth%u_%u", port_id, i);
+    //conf.min_mtu = 1000;//dev_info.min_mtu;
+	//conf.max_mtu = 1500;//dev_info.max_mtu;
+    conf.group_id = port_id;
+    //rte_eth_dev_get_mtu(port_id, &mtu);
+    //conf.mbuf_size = mtu + KNI_ENET_HEADER_SIZE + KNI_ENET_FCS_SIZE;
+    // if tso,maybe ptk will be drop in kernel becase mbuf_size too small, and show on dev stats tx_dropped
+	conf.mbuf_size = MAX_PACKET_SZ;conf.core_id = 1;//rte_lcore_id();
+	conf.force_bind = 1;
+
+    memset(&ops, 0, sizeof(ops));
+	ops.port_id = port_id;
+    
+    kni = rte_kni_alloc(pktmbuf_pool[port_id], &conf, &ops);
+    if (!kni)
+        rte_exit(EXIT_FAILURE, "Fail to create kni for "
+                    "port: %d\n", port_id);
+    params[port_id]->kni[i] = kni;
+    return 0;
+}
+
+int ff_sendto_mykni(char *buf, int len) {
+    struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+    int nb_kni_tx = 0;
+    struct rte_mbuf *mb = NULL;
+    mb = rte_pktmbuf_alloc(pktmbuf_pool[port_id]);
+    if (!mb) {
+        return -1;
+    }
+
+    //memcpy(mb->buf_addr+mb->data_off, buf, len);
+    rte_memcpy(rte_pktmbuf_mtod_offset(mb, char *, 0), buf, (size_t) len);
+    // mb->next = NULL;
+    // mb->nb_segs = 1;
+    mb->pkt_len = len;
+    mb->data_len = len;
+    pkts_burst_tx[nb_rx] = mb;
+    nb_tx++;
+
+    if (nb_tx == PKT_BURST_SZ) {
+        nb_kni_tx = rte_kni_tx_burst(kni, pkts_burst_tx, nb_tx);
+        if (nb_kni_tx) {
+            kni_stats[port_id].rx_packets += nb_kni_tx;
+        }
+        if(nb_kni_tx < nb_tx) {
+            uint16_t i;
+            for(i = nb_kni_tx; i < nb_tx; ++i)
+                rte_pktmbuf_free(pkts_burst_tx[i]);
+        
+            kni_stats[port_id].rx_dropped += (nb_tx - nb_kni_tx);
+        }
+        nb_tx = 0;//reset
+    }
+    return 0;   
+}
+
+int ff_flush_mykni() {
+    struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+    int nb_kni_tx = 0;
+    if (nb_tx == 0) {
+        return 0;
+    }
+    nb_kni_tx = rte_kni_tx_burst(kni, pkts_burst_tx, nb_tx);
+    if (nb_kni_tx)
+            kni_stats[port_id].rx_packets += nb_kni_tx;
+
+    if(nb_kni_tx < nb_tx) {
+        uint16_t i;
+        for(i = nb_kni_tx; i < nb_tx; ++i)
+            rte_pktmbuf_free(pkts_burst_tx[i]);
+    
+        kni_stats[port_id].rx_dropped += (nb_tx - nb_kni_tx);
+    }
+    nb_tx = 0;//reset
+    return nb_kni_tx;
+}
+
+int ff_mykni_txbuf_len() {
+    return nb_tx;
+}
+
+// return 0, means nb_rx == 0 and rx_index == 0
+int get_data_from_rxbuf(char *buf, int cap) {
+    struct rte_mbuf *mb = NULL;
+    if (nb_rx){
+        mb = pkts_burst_rx[rx_index];
+        if (!mb){
+            rte_exit(EXIT_FAILURE, "Could not be NULL, rx_index:%d, nb_rx:%d\n", rx_index, nb_rx);
+            return -1;
+        }
+        if (mb->data_len > cap)
+            return -1;
+        rte_memcpy(buf, rte_pktmbuf_mtod(mb, char *), (size_t) mb->data_len);
+        //rte_memcpy(buf, rte_pktmbuf_mtod_offset(mb, char *, 0), (size_t) mb->data_len);
+        //rte_pktmbuf_data_len(m);
+        //memcpy(buf, mb->buf_addr+mb->data_off, mb->data_len);
+        rte_pktmbuf_free(mb);
+        pkts_burst_rx[rx_index] = NULL;
+        nb_rx--;
+        if (nb_rx)
+            rx_index++;
+        else 
+            rx_index = 0;
+
+        return mb->data_len;
+    }
+
+    //check 
+    if (rx_index) {
+        rte_exit(EXIT_FAILURE, "invaild, rx_index:%d, nb_rx:%d\n", rx_index, nb_rx);
+        return -1;
+    }
+    return 0; //need to burst read
+}
+
+int ff_mykni_read(char *buf, int cap) {
+    int len;
+    if (!buf)
+        return 0;
+
+    len = get_data_from_rxbuf(buf, cap);
+    if (!len){
+        struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+        nb_rx = rte_kni_rx_burst(kni, pkts_burst_rx, sizeof(pkts_burst_rx));
+        if (nb_rx)
+            len = get_data_from_rxbuf(buf, cap);
+    }
+    return len;
+}
+
+int ff_mykni_read_multi(char **buf, int nb, int cap) {
+    int i, len;
+    int has_rx;
+    for(i = 0; i < nb; i++ ) {
+        if (!buf[i])
+            break;
+
+        len = get_data_from_rxbuf(buf[i], cap); 
+        if (!len && !has_rx){
+            struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+            nb_rx = rte_kni_rx_burst(kni, pkts_burst_rx, sizeof(pkts_burst_rx));
+            if (nb_rx)
+                len = get_data_from_rxbuf(buf[i], cap);
+            has_rx = 1;
+        }
+        // still no data, break loop
+        if (!len)
+            break;      
+    }
+
+    return i;
+}
