@@ -677,8 +677,8 @@ ff_mykni_env() {
 	}
 
     //testing
-    mb = rte_mbuf_raw_alloc(pktmbuf_pool[port_id]);
-    //mb = rte_pktmbuf_alloc(pktmbuf_pool[port_id]);
+    //mb = rte_mbuf_raw_alloc(pktmbuf_pool[port_id]);
+    mb = rte_pktmbuf_alloc(pktmbuf_pool[port_id]);
     if (!mb) {
         rte_exit(EXIT_FAILURE, "Could not alloc mbuf from pool\n");
 		return -1;
@@ -810,7 +810,7 @@ int get_data_from_rxbuf(char *buf, int cap) {
         return mb->data_len;
     }
 
-    //check 
+    //no data ? check 
     if (rx_index) {
         rte_exit(EXIT_FAILURE, "invaild, rx_index:%d, nb_rx:%d\n", rx_index, nb_rx);
         return -1;
@@ -833,7 +833,7 @@ int ff_mykni_read(char *buf, int cap) {
     return len;
 }
 
-int ff_mykni_read_multi(char **buf, int nb, int cap) {
+int ff_mykni_read_multi(char **buf,int *data_len, int nb, int cap) {
     int i, len;
     int has_rx;
     for(i = 0; i < nb; i++ ) {
@@ -841,6 +841,7 @@ int ff_mykni_read_multi(char **buf, int nb, int cap) {
             break;
 
         len = get_data_from_rxbuf(buf[i], cap); 
+        data_len[i] = len;
         if (!len && !has_rx){
             struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
             nb_rx = rte_kni_rx_burst(kni, pkts_burst_rx, sizeof(pkts_burst_rx));
@@ -855,3 +856,523 @@ int ff_mykni_read_multi(char **buf, int nb, int cap) {
 
     return i;
 }
+
+#define FDS_TABLE_SIZE_DEFAULT 16
+int fds_table_size = 0;
+struct list_head *fds_table;
+struct fd_node {
+    struct list_head    list;
+    struct rte_ether_addr mac;
+    int fd;
+}__rte_cache_aligned;
+
+void init_fds_table(int size){
+    int i;
+    fds_table_size = size;
+    if (!fds_table_size)
+        fds_table_size = FDS_TABLE_SIZE_DEFAULT;
+    
+    fds_table = rte_malloc_socket(NULL, sizeof(struct list_head) * fds_table_size,
+            RTE_CACHE_LINE_SIZE, rte_socket_id());
+    if (fds_table == NULL)
+        rte_exit(EXIT_FAILURE, "rte_zmalloc_socket:%d, sizeof(struct list_head) * fds_table_size) "
+            "failed\n", rte_socket_id()); 
+
+    for (i = 0; i < fds_table_size; i++)
+        INIT_LIST_HEAD(&fds_table[i]);
+}
+// todo: destroy fds_table
+
+void print_mac(struct rte_ether_addr *mac) {
+    printf(" MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
+		mac->addr_bytes[0],mac->addr_bytes[1],mac->addr_bytes[2],
+				mac->addr_bytes[3],mac->addr_bytes[4],mac->addr_bytes[5]);
+}
+
+int mac_hash(struct rte_ether_addr *mac, int mask ) {
+    return (mac->addr_bytes[0]+mac->addr_bytes[1]+mac->addr_bytes[2]+
+				mac->addr_bytes[3]+mac->addr_bytes[4]+mac->addr_bytes[5])&mask;
+}
+//rte_ether_addr_copy, rte_is_same_ether_addr
+int get_fd_by_mac(struct rte_ether_addr *mac) {
+    int hash = mac_hash(mac, fds_table_size-1);
+    struct fd_node *node;
+    list_for_each_entry(node, &fds_table[hash], list) {
+        if (rte_is_same_ether_addr(&node->mac, mac)) {
+            return node->fd;
+        }
+    }
+    return -1;
+}
+
+struct fd_node * get_node_by_mac(struct rte_ether_addr *mac) {
+    int hash = mac_hash(mac, fds_table_size-1);
+    struct fd_node *node;
+    list_for_each_entry(node, &fds_table[hash], list) {
+        if (rte_is_same_ether_addr(&node->mac, mac)) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+int get_fd_by_data(char *buf, int buf_len) {
+    if (sizeof(struct rte_ether_hdr) < buf_len) {
+        return -1;
+    }
+	struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)buf;
+    return get_fd_by_mac(&eth_hdr->d_addr);
+}
+
+int learn_fd_mac(char *buf, int buf_len, int fd) {
+    if (sizeof(struct rte_ether_hdr) < buf_len) {
+        return -1;
+    }
+    struct fd_node *node;
+    struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)buf;    
+
+    node = get_node_by_mac(&eth_hdr->s_addr);
+    if (node) {
+        if (node->fd == fd) 
+            return 0;
+        //update fd
+        print_mac(&eth_hdr->s_addr);
+        printf("fdb update: current fd:%d change to new fd:%d\n", node->fd, fd);
+        node->fd = fd;
+        return 1;
+    }
+
+    //new node
+    node = rte_zmalloc_socket(NULL, sizeof(struct fd_node),
+            RTE_CACHE_LINE_SIZE, rte_socket_id());
+    if (node == NULL)
+        rte_exit(EXIT_FAILURE, "rte_zmalloc_socket:%d, sizeof(struct fd_node)) "
+            "failed\n", rte_socket_id());
+    rte_ether_addr_copy(&eth_hdr->s_addr, &node->mac);
+    node->fd = fd;
+
+    //add to fds_table
+    int hash = mac_hash(&eth_hdr->s_addr, fds_table_size-1);
+    list_add(&node->list, &fds_table[hash]);
+    return 1;
+}
+
+#if 1
+//power of two
+struct iobuf {
+    unsigned int head;
+    unsigned int tail;
+    //int size;
+    int cap;//power of two
+    int mask;
+    int fd;
+    ssize_t (*readv)(int fd, const struct iovec *iov, int iovcnt);
+    char buf[0];
+};
+
+struct iobuf* create_iobuf(int cap, int fd) {
+    if (cap & (cap -1)){
+        printf("cap:%d is not power of two", cap)
+        return NULL;
+    }
+
+    struct iobuf *ib = rte_zmalloc_socket(NULL, sizeof(struct iobuf)+cap,
+            RTE_CACHE_LINE_SIZE, rte_socket_id());
+    if (!ib)
+        return ib;
+
+    ib->cap = cap;
+    ib->mask = cap-1;
+    ib->fd = fd;
+    ib->readv = ff_readv;
+    return ib;
+}
+
+//return actually iovec counter
+int get_iovs(struct iobuf *ib, struct iovec *iovs, int iovcnt) {
+    int head = ib->head&ib->mask;
+    int tail = ib->tail&ib->mask;
+    char buf = ib->buf;
+    int actual_iovcnt = 0;
+
+    //no space
+    if (ib->head == ib->tail)
+        return 0;
+
+    //0-->tail --> head--->cap
+    if (head >= tail) {
+        // head--->cap
+        iovs[actual_iovcnt].iov_base = &buf[head];
+        iovs[actual_iovcnt].iov_len = cap-head;
+        actual_iovcnt++;
+        if (tail > 0) {
+            //buf is 0:tail
+            iovs[actual_iovcnt].iov_base = buf;
+            iovs[actual_iovcnt].iov_len = tail;
+            actual_iovcnt++;
+        }
+        return actual_iovcnt
+    }
+
+    //0-->head-->tail--->cap
+    if (head < tail) {
+        iovs[actual_iovcnt].iov_base = &buf[head];
+        iovs[actual_iovcnt].iov_len = tail-head;
+        actual_iovcnt++;
+        return actual_iovcnt;
+    }
+    //never be here
+}
+
+// do it after get data from iobuf
+void iobuf_movetail(struct iobuf *ib, int n) {
+    if (n <= 0) 
+        return;
+    
+    // it is ok for ib->head wrap
+    int size = ib->head - ib->tail;
+    //iobuf_movetail means have got data, so n must < size
+    if (ib->size < n)
+        rte_exit(EXIT_FAILURE, "size(%d) < n(%d)\n", size, n); 
+    
+    ib->tail += n;
+    return;
+}
+
+//do it after read data and put to iobuf, should move head
+void iobuf_movehead(struct iobuf *ib, int n) {
+    int head = ib->head;
+    int tail = ib->tail;
+    int cap = ib->cap;
+    int size = ib->size;
+
+    if (n == 0)
+        return 0;
+
+    int size = ib->head - ib->tail;
+    //no space
+    if (n > cap - size)
+        rte_exit(EXIT_FAILURE, "n(%d) > cap(%d)-size(%d)\n",n , cap, size);
+    
+    ib->head += n;
+    return;
+}
+
+int iobuf_readv(struct iobuf *ib){
+    struct iovec iovs[2];
+    int iovcnt = get_iovs(ib, iovs, 2);
+    int read_len = ib->readv(ib->fd, iovs, iovcnt);//ff_readv
+    // todo: ff_readv err case, 
+    if (read_len == -1 )
+        return read_len;
+
+    iobuf_movehead(ib, read_len);
+}
+
+//must get fix len data 
+int peek_iobuf_data(struct iobuf *ib, char *peek_buf, int len){
+    int head, tail, size;
+    int cap = ib->cap;
+    char buf = ib->buf;
+    int max_read = 1;
+    int i = 0; 
+    int ret = 0;
+
+    //can't peek data bigger than iobuf cap
+    if（cap < len) {
+        printf("peek_iobuf_data: cap(%d) < len(%d)", cap, len)
+        return 0
+    }
+
+    for ( i = 0; i <= max_read; i++) {
+        head = ib->head&ib->mask;
+        tail = ib->tail&ib->mask;
+        size = ib->head - ib->tail;
+
+        if (size < len) {
+             //no enough data, read io 
+            if ((ret = iobuf_readv(ib)) < 0)
+                return ret;
+            continue;
+        }
+
+        //have enough data in buf
+        if (head > tail) {
+            //check, must head - tail >= len
+            if (head - tail < len)
+                rte_exit(EXIT_FAILURE, "never happen: head(%d) -tail(%d) < len(%d) \n",head, tail, len);
+            
+            rte_memcpy(peek_buf, &buf[tail], len)
+            return len;
+        }
+
+        //ib->head wrap
+        if (head <= tail) {
+            int contiguous = cap - tail;
+            if ( contiguous >= len) {
+                rte_memcpy(peek_buf, &buf[tail], len)
+                return len;
+            }
+            // should copy tow contiguous memory
+            rte_memcpy(peek_buf, &buf[tail], contiguous);
+            rte_memcpy(&peek_buf[contiguous], buf, len-contiguous);
+            return len;
+        }
+    }
+    return 0;
+}
+
+int peek(struct iobuf *ib, char *buf, int len)
+    return peek_iobuf_data(ib, buf, len);
+}
+
+int read(struct iobuf *ib, char *buf, int len) {
+    int get_data_len = peek_iobuf_data(ib, buf, len);
+    iobuf_movetail(get_data_len);
+    return get_data_len;
+}
+
+#else
+struct iobuf {
+    int head;
+    int tail;
+    int size; // data len in buf
+    int cap;
+    int fd;
+    char buf[0];
+};
+
+struct iobuf* create_iobuf(int cap, int fd) {
+    struct iobuf *ib = rte_zmalloc_socket(NULL, sizeof(struct iobuf)+size,
+            RTE_CACHE_LINE_SIZE, rte_socket_id());
+    if (!ib)
+        return ib;
+
+    ib->cap = cap;
+    ib->fd = fd;
+    return ib;
+}
+
+//return actually iovec counter
+int get_iovs(struct iobuf *ib, struct iovec *iovs, int iovcnt) {
+    int head = ib->head;
+    int tail = ib->tail;
+    int cap = ib->cap;
+    char buf = ib->buf;
+    int actual_iovcnt = 0;
+
+    //no space
+    if (ib->size == cap)
+        return 0;
+
+    //0-->tail --> head--->cap
+    if (head >= tail) {
+        // head--->cap
+        iovs[actual_iovcnt].iov_base = &buf[head];
+        iovs[actual_iovcnt].iov_len = cap-head;
+        actual_iovcnt++;
+        if (tail > 0) {
+            //buf is 0:tail
+            iovs[actual_iovcnt].iov_base = buf;
+            iovs[actual_iovcnt].iov_len = tail;
+            actual_iovcnt++;
+        }
+        return actual_iovcnt
+    }
+
+    //0-->head-->tail--->cap
+    if (head < tail) {
+        iovs[actual_iovcnt].iov_base = &buf[head];
+        iovs[actual_iovcnt].iov_len = tail-head;
+        actual_iovcnt++;
+        return actual_iovcnt;
+    }
+    //never be here
+}
+
+// do it after get data from iobuf
+void iobuf_movetail(struct iobuf *ib, int n) {
+    int head = ib->head;
+    int tail = ib->tail;
+    int cap = ib->cap;
+
+    if (n <= 0) {
+        return;
+    }
+
+    //must have data, and  n must < size
+    if (ib->size < n)
+        rte_exit(EXIT_FAILURE, "size(%d) < n(%d)\n", size, n); 
+    
+    if (head > tail) {
+        ib->tail += n;
+        ib->size -= n;
+        return;
+    }
+    // head < tail or head == tail
+    if (cap-tail > n) {
+        ib->tail += n;
+        return;
+    }
+    ib->tail = n-(cap-tail);
+    ib->size -= n;
+    return;
+}
+
+//do it after read data and put to iobuf
+void iobuf_movehead(struct iobuf *ib, int n) {
+    int head = ib->head;
+    int tail = ib->tail;
+    int cap = ib->cap;
+    int size = ib->size;
+
+    if (n == 0)
+        return 0;
+
+    //full
+    //if (size == cap) 
+    //    return 0;
+
+    if (n > cap-size) {
+        printf("unexpect case: no enough space, n(%d) > cap(%d)-size(%d)\n", n, cap, size); 
+        return 0;
+    }
+
+    if (head > tail || (/*head == tail &&*/ size == 0 )) {
+        if (head + n <= cap) {
+            ib->head = head + n;
+            if (ib->head == cap)
+                ib->head = 0;
+
+            ib->size += n;
+            return n;
+        }
+        //wrap case
+        head = n+head-cap;
+        if (head > tail) 
+            rte_exit(EXIT_FAILURE, "head(%d) > tail(%d)\n", head, tail); 
+        
+        ib->head = head;
+        ib->size += n;
+        return n;
+    }
+
+    //head < tail
+    ib->head = head + n;
+    ib->size += n;
+    //check
+    if (head > tail) 
+        rte_exit(EXIT_FAILURE, "head(%d) > tail(%d)\n", head, tail);
+
+    return n;
+}
+
+int iobuf_readv(struct iobuf *ib){
+    struct iovec iovs[2];
+    int iovcnt = get_iovs(ib, iovs, 2);
+    int read_len = ff_readv(ib->fd, iovs, iovcnt);
+    // todo: ff_readv err case, 
+    if (read_len == -1 )
+        return read_len;
+
+    iobuf_movehead(ib, read_len);
+}
+
+int peek_iobuf_data(struct iobuf *ib, char *peek_buf, int len){
+    int head = ib->head;
+    int tail = ib->tail;
+    int cap = ib->cap;  
+    char buf = ib->buf;
+    int max_read = 1;
+    int i = 0; 
+    int ret = 0;
+
+    for ( i = 0; i <= max_read; i++) {
+        int size = ib->size;
+        if (size < len) {
+             //no enough data, read io 
+            if ((ret = iobuf_readv(ib)) < 0)
+                return ret;
+            continue;
+        }
+
+        //have enough data in buf
+        if (head > tail) {
+            //check, must head - tail >= len
+            if (head - tail < len)
+                rte_exit(EXIT_FAILURE, "never happen: head(%d) -tail(%d) < len(%d) \n",head, tail, len);
+            
+            rte_memcpy(peek_buf, &buf[tail], len)
+            return len;
+        }
+
+        if (head < tail) {
+            int contiguous = cap - tail;
+            if ( contiguous >= len) {
+                rte_memcpy(peek_buf, &buf[tail], len)
+                return len;
+            }
+            // should copy tow contiguous memory
+            rte_memcpy(peek_buf, &buf[tail], contiguous);
+            rte_memcpy(&peek_buf[contiguous], buf, len-contiguous);
+            return len;
+        }
+
+        #if 0
+        if (head > tail) {
+            if (head - tail > len){
+                rte_memcpy(peek_buf, &buf[tail], len)
+                return len;
+            }
+            //no enough data, read io 
+            if ((ret = iobuf_readv(ib)) < 0)
+                return ret;
+            continue;
+        }
+
+        if (head < tail) {
+            if (cap - (tail-head) > len) {
+                rte_memcpy(peek_buf, &buf[tail], cap - tail);
+                rte_memcpy(&peek_buf[cap-tail], buf, len-(cap - tail));
+                return len;
+            }
+            //no enough data, read io 
+            if ((ret = iobuf_readv(ib)) < 0)
+                return ret;
+            continue;
+        }
+
+        //emtpy
+        if (head == tail && size == 0) {
+            //no enough data, read io 
+            if ((ret = iobuf_readv(ib)) < 0)
+                return ret;
+            continue;
+        }
+
+        //full
+        if (head == tail ) {
+            if (len > size)
+                return 0;//too large peek_buf
+            if (cap - tail > len) {
+                rte_memcpy(peek_buf, &buf[tail], len);
+            } else {
+                rte_memcpy(peek_buf, &buf[tail], cap - tail);
+                rte_memcpy(&peek_buf[cap-tail], buf, len-(cap - tail));
+            }
+            return len;
+        }
+        #endif
+    }
+}
+
+int peek(struct iobuf *ib, char *buf, int len)
+    return peek_iobuf_data(ib, buf, len);
+}
+
+int read(struct iobuf *ib, char *buf, int len) {
+    int get_data_len = peek_iobuf_data(ib, buf, len);
+    iobuf_movetail(get_data_len);
+    return get_data_len;
+}
+#endif

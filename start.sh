@@ -64,3 +64,6 @@ do
         ${bin} --conf ${conf} --proc-type=secondary --proc-id=${proc_id} ${others} &
     fi
 done
+/*
+
+*/

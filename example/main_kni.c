@@ -15,8 +15,9 @@
 #include "ff_api.h"
 #include "ff_epoll.h"
 #include "ff_dpdk_kni.h"
-
 //-----------------------------
+//#include "list.h"
+//--------------------
 #define MAX_EVENTS 512
 
 struct epoll_event ev;
@@ -62,22 +63,31 @@ char html[] =
 char buf_sock[PKT_SIZE];
 char buf_kni[PKT_SIZE];
 char buf_kni_burst[PKT_BURST][PKT_SIZE];
+int data_len[PKT_BURST];
 
 int loop(void *arg)
 {
     /* Wait for events to happen */
 
     int nevents = ff_epoll_wait(epfd,  events, MAX_EVENTS, 0);
-    int i, nb;
+    int i, nb, fd;
     
     unsigned int num;
     if (!nevents) {
+        // try to flush txbuf data to kni
         if(ff_mykni_txbuf_len())
             ff_flush_mykni();
     }
+
     // get data from mykni
     //len = ff_mykni_read(buf_kni, PKT_SIZE);
-    nb = ff_mykni_read_multi(buf_kni_burst, PKT_BURST, PKT_SIZE);
+    nb = ff_mykni_read_multi(buf_kni_burst, data_len, PKT_BURST, PKT_SIZE);
+    for (i = 0; i < nb; i++) {
+        fd = get_fd_by_data(buf_kni_burst[i], data_len[i]);
+        if (fd > 0) {
+            ff_write(fd, buf_kni_burst[i], data_len[i]);
+        }
+    }
 
     for (i = 0; i < nevents; ++i) {
         /* Handle new connect */
@@ -96,29 +106,34 @@ int loop(void *arg)
                         strerror(errno));
                     break;
                 }
+                printf("ff_epoll_ctl add new fd:%d\n", nclientfd);
             }
         } else { 
             if (events[i].events & EPOLLERR ) {
                 /* Simply close socket */
                 ff_epoll_ctl(epfd, EPOLL_CTL_DEL,  events[i].data.fd, NULL);
                 ff_close(events[i].data.fd);
-            } else if (events[i].events & EPOLLIN) {    
+                printf("ff_epoll_ctl EPOLL_CTL_DEL and close fd:%d\n", events[i].data.fd);
+            } else if (events[i].events & EPOLLIN) {
                 memset(buf_sock, 0, sizeof(buf_sock));           
-                size_t readlen = ff_read( events[i].data.fd, buf_sock, sizeof(buf_sock));
+                size_t readlen = ff_read(events[i].data.fd, buf_sock, sizeof(buf_sock));
                 if(readlen > 0) {
                     //ff_write( events[i].data.fd, html, sizeof(html) - 1);
+                    learn_fd_mac(buf_sock, readlen, events[i].data.fd);
                     ff_sendto_mykni(buf_sock, readlen);
                         
                 } else {
                     ff_epoll_ctl(epfd, EPOLL_CTL_DEL,  events[i].data.fd, NULL);
                     ff_close( events[i].data.fd);
+                    printf("read fd fail, EPOLL_CTL_DEL and close fd:%d\n", events[i].data.fd);
                 }
             } else {
-                printf("unknown event: %8.8X\n", events[i].events);
+                printf("fd :%d unknown event: %8.8X\n", events[i].data.fd, events[i].events);
             }
         }
     }
 }
+
 
 int main(int argc, char * argv[])
 {
@@ -129,6 +144,8 @@ int main(int argc, char * argv[])
     ff_mykni_env();
     printf("start kni_alloc();\n");
     ff_mykni_alloc();
+    printf("start init_fds_table();\n");
+    init_fds_table(16);
 
     sockfd = ff_socket(AF_INET, SOCK_STREAM, 0);
     printf("sockfd:%d\n", sockfd);

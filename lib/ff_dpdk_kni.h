@@ -63,7 +63,11 @@ int ff_sendto_mykni(char *buf, int len);
 int ff_flush_mykni();
 int ff_mykni_txbuf_len();
 int ff_mykni_read(char *buf, int cap);
-int ff_mykni_read_multi(char **buf, int nb, int cap);
+int ff_mykni_read_multi(char **buf, int *data_len, int nb, int cap);
+void init_fds_table(int size);
+int get_fd_by_data(char *buf, int buf_len);
+int learn_fd_mac(char *buf, int buf_len, int fd);
+
 // end of mykni
 
 #endif /* ifndef _FSTACK_DPDK_KNI_H */

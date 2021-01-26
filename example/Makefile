@@ -8,6 +8,7 @@ ifeq ($(FF_DPDK),)
 	FF_DPDK=${TOPDIR}/dpdk/x86_64-native-linuxapp-gcc
 endif
 
+#-lfstack, here -L${FF_PATH}/lib, so fstack don't have to install to /usr/local/lib
 LIBS+= -L${FF_PATH}/lib -Wl,--whole-archive,-lfstack,--no-whole-archive
 LIBS+= -L${FF_DPDK}/lib -Wl,--whole-archive,-ldpdk,--no-whole-archive
 LIBS+= -Wl,--no-whole-archive -lrt -lm -ldl -lcrypto -pthread -lnuma
