@@ -724,6 +724,33 @@ int ff_mykni_alloc()
     return 0;
 }
 
+int ff_sendto_mykni_now(char *buf, int len) {
+    struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+    int nb_kni_tx = 0;
+    int num = 1;
+    struct rte_mbuf *mb = NULL;
+    mb = rte_pktmbuf_alloc(pktmbuf_pool[port_id]);
+    if (!mb) {
+        return -1;
+    }
+    //memcpy(mb->buf_addr+mb->data_off, buf, len);
+    //rte_memcpy(rte_pktmbuf_mtod_offset(mb, char *, 0), buf, (size_t) len);
+    rte_memcpy(rte_pktmbuf_mtod(mb, char *), buf, (size_t) len);
+    // mb->next = NULL;
+    // mb->nb_segs = 1;
+    mb->pkt_len = len;
+    mb->data_len = len;
+
+    nb_kni_tx = rte_kni_tx_burst(kni, &mb, num);
+    if (nb_kni_tx != num) {
+        rte_pktmbuf_free(mb);
+        kni_stats[port_id].rx_dropped += num;
+        return -1;
+    }
+    kni_stats[port_id].rx_packets += num;
+    return 0;
+}
+
 int ff_sendto_mykni(char *buf, int len) {
     struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
     int nb_kni_tx = 0;
@@ -972,7 +999,7 @@ struct iobuf {
 
 struct iobuf* create_iobuf(int cap, int fd) {
     if (cap & (cap -1)){
-        printf("cap:%d is not power of two", cap)
+        printf("cap:%d is not power of two", cap);
         return NULL;
     }
 
@@ -984,7 +1011,7 @@ struct iobuf* create_iobuf(int cap, int fd) {
     ib->cap = cap;
     ib->mask = cap-1;
     ib->fd = fd;
-    ib->readv = ff_readv;
+    //ib->readv = ff_readv;  //todo
     return ib;
 }
 
@@ -992,7 +1019,7 @@ struct iobuf* create_iobuf(int cap, int fd) {
 int get_iovs(struct iobuf *ib, struct iovec *iovs, int iovcnt) {
     int head = ib->head&ib->mask;
     int tail = ib->tail&ib->mask;
-    char buf = ib->buf;
+    char *buf = ib->buf;
     int actual_iovcnt = 0;
 
     //no space
@@ -1003,7 +1030,7 @@ int get_iovs(struct iobuf *ib, struct iovec *iovs, int iovcnt) {
     if (head >= tail) {
         // head--->cap
         iovs[actual_iovcnt].iov_base = &buf[head];
-        iovs[actual_iovcnt].iov_len = cap-head;
+        iovs[actual_iovcnt].iov_len = ib->cap-head;
         actual_iovcnt++;
         if (tail > 0) {
             //buf is 0:tail
@@ -1011,7 +1038,7 @@ int get_iovs(struct iobuf *ib, struct iovec *iovs, int iovcnt) {
             iovs[actual_iovcnt].iov_len = tail;
             actual_iovcnt++;
         }
-        return actual_iovcnt
+        return actual_iovcnt;
     }
 
     //0-->head-->tail--->cap
@@ -1022,6 +1049,7 @@ int get_iovs(struct iobuf *ib, struct iovec *iovs, int iovcnt) {
         return actual_iovcnt;
     }
     //never be here
+    return 0;
 }
 
 // do it after get data from iobuf
@@ -1032,7 +1060,7 @@ void iobuf_movetail(struct iobuf *ib, int n) {
     // it is ok for ib->head wrap
     int size = ib->head - ib->tail;
     //iobuf_movetail means have got data, so n must < size
-    if (ib->size < n)
+    if (size < n)
         rte_exit(EXIT_FAILURE, "size(%d) < n(%d)\n", size, n); 
     
     ib->tail += n;
@@ -1044,10 +1072,10 @@ void iobuf_movehead(struct iobuf *ib, int n) {
     int head = ib->head;
     int tail = ib->tail;
     int cap = ib->cap;
-    int size = ib->size;
+    //int size = ib->size;
 
     if (n == 0)
-        return 0;
+        return ;
 
     int size = ib->head - ib->tail;
     //no space
@@ -1067,24 +1095,25 @@ int iobuf_readv(struct iobuf *ib){
         return read_len;
 
     iobuf_movehead(ib, read_len);
+    return read_len;
 }
 
 //must get fix len data 
 int peek_iobuf_data(struct iobuf *ib, char *peek_buf, int len){
     int head, tail, size;
     int cap = ib->cap;
-    char buf = ib->buf;
+    char *buf = ib->buf;
     int max_read = 1;
     int i = 0; 
     int ret = 0;
 
     //can't peek data bigger than iobuf cap
-    if（cap < len) {
-        printf("peek_iobuf_data: cap(%d) < len(%d)", cap, len)
-        return 0
+    if (cap < len) {
+        //printf("peek_iobuf_data: cap(%d) < len(%d)\n", cap, len);
+        return 0;
     }
 
-    for ( i = 0; i <= max_read; i++) {
+    for (i = 0; i <= max_read; i++) {
         head = ib->head&ib->mask;
         tail = ib->tail&ib->mask;
         size = ib->head - ib->tail;
@@ -1102,7 +1131,7 @@ int peek_iobuf_data(struct iobuf *ib, char *peek_buf, int len){
             if (head - tail < len)
                 rte_exit(EXIT_FAILURE, "never happen: head(%d) -tail(%d) < len(%d) \n",head, tail, len);
             
-            rte_memcpy(peek_buf, &buf[tail], len)
+            rte_memcpy(peek_buf, &buf[tail], len);
             return len;
         }
 
@@ -1110,7 +1139,7 @@ int peek_iobuf_data(struct iobuf *ib, char *peek_buf, int len){
         if (head <= tail) {
             int contiguous = cap - tail;
             if ( contiguous >= len) {
-                rte_memcpy(peek_buf, &buf[tail], len)
+                rte_memcpy(peek_buf, &buf[tail], len);
                 return len;
             }
             // should copy tow contiguous memory
@@ -1122,13 +1151,13 @@ int peek_iobuf_data(struct iobuf *ib, char *peek_buf, int len){
     return 0;
 }
 
-int peek(struct iobuf *ib, char *buf, int len)
+int peek(struct iobuf *ib, char *buf, int len){
     return peek_iobuf_data(ib, buf, len);
 }
 
 int read(struct iobuf *ib, char *buf, int len) {
     int get_data_len = peek_iobuf_data(ib, buf, len);
-    iobuf_movetail(get_data_len);
+    iobuf_movetail(ib, get_data_len);
     return get_data_len;
 }
 
