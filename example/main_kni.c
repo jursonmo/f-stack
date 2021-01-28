@@ -71,7 +71,8 @@ int loop(void *arg)
 
     int nevents = ff_epoll_wait(epfd,  events, MAX_EVENTS, 0);
     int i, nb, fd;
-    
+    int write_len;
+
     unsigned int num;
     if (!nevents) {
         // try to flush txbuf data to kni
@@ -85,7 +86,12 @@ int loop(void *arg)
     for (i = 0; i < nb; i++) {
         fd = get_fd_by_data(buf_kni_burst[i], data_len[i]);
         if (fd > 0) {
-            ff_write(fd, buf_kni_burst[i], data_len[i]);
+            write_len = ff_write(fd, buf_kni_burst[i], data_len[i]);
+            if (write_len == -1){
+                ff_epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                ff_close(fd);
+                printf("write fd fail, EPOLL_CTL_DEL and close fd:%d\n", fd);
+            }
         }
     }
 
@@ -120,8 +126,8 @@ int loop(void *arg)
                 if(readlen > 0) {
                     //ff_write( events[i].data.fd, html, sizeof(html) - 1);
                     learn_fd_mac(buf_sock, readlen, events[i].data.fd);
-                    ff_sendto_mykni(buf_sock, readlen);
-                        
+                    //ff_sendto_mykni(buf_sock, readlen);
+                    ff_sendto_mykni_now(buf_sock, readlen);
                 } else {
                     ff_epoll_ctl(epfd, EPOLL_CTL_DEL,  events[i].data.fd, NULL);
                     ff_close( events[i].data.fd);

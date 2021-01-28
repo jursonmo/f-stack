@@ -41,7 +41,7 @@
 
 #include "ff_dpdk_kni.h"
 #include "ff_config.h"
-
+#include "list.h" //for mykni
 /* Callback for request of changing MTU */
 /* Total octets in ethernet header */
 #define KNI_ENET_HEADER_SIZE    14
