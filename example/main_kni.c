@@ -58,6 +58,7 @@ char html[] =
 "</body>\r\n"
 "</html>";
 
+#define DEBUG 1
 #define PKT_SIZE 2048
 #define PKT_BURST 32
 char buf_sock[PKT_SIZE];
@@ -75,18 +76,28 @@ int loop(void *arg)
 
     unsigned int num;
     if (!nevents) {
+        //handle kni dev link change
+        ff_kni_handle_request();
         // try to flush txbuf data to kni
         if(ff_mykni_txbuf_len())
             ff_flush_mykni();
     }
+    if (DEBUG && nevents > 0) 
+        printf("nevents :%d\n", nevents);    
 
     // get data from mykni
     //len = ff_mykni_read(buf_kni, PKT_SIZE);
     nb = ff_mykni_read_multi(buf_kni_burst, data_len, PKT_BURST, PKT_SIZE);
+    if (DEBUG && nb) {
+        printf("----read from kni dev, pkg:%d\n", nb);
+    }
     for (i = 0; i < nb; i++) {
         fd = get_fd_by_data(buf_kni_burst[i], data_len[i]);
         if (fd > 0) {
             write_len = ff_write(fd, buf_kni_burst[i], data_len[i]);
+            if (DEBUG)
+                printf("ff_write: write_len:%d\n", write_len);
+
             if (write_len == -1){
                 ff_epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                 ff_close(fd);
@@ -125,12 +136,14 @@ int loop(void *arg)
                 size_t readlen = ff_read(events[i].data.fd, buf_sock, sizeof(buf_sock));
                 if(readlen > 0) {
                     //ff_write( events[i].data.fd, html, sizeof(html) - 1);
+                    if (DEBUG)
+                        printf("read len:%lu \n", readlen);
                     learn_fd_mac(buf_sock, readlen, events[i].data.fd);
                     //ff_sendto_mykni(buf_sock, readlen);
                     ff_sendto_mykni_now(buf_sock, readlen);
                 } else {
                     ff_epoll_ctl(epfd, EPOLL_CTL_DEL,  events[i].data.fd, NULL);
-                    ff_close( events[i].data.fd);
+                    ff_close(events[i].data.fd);
                     printf("read fd fail, EPOLL_CTL_DEL and close fd:%d\n", events[i].data.fd);
                 }
             } else {

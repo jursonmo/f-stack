@@ -590,6 +590,8 @@ static struct kni_interface_stats kni_stats[RTE_MAX_ETHPORTS];
 #define MEMPOOL_CACHE_SZ        PKT_BURST_SZ
 
 #define KNI_MAX_KTHREAD 32
+
+#define DEBUG 1
 /*
  * Structure of port parameters
  */
@@ -694,6 +696,10 @@ ff_mykni_env() {
     return 0;
 }
 
+int ff_kni_handle_request() {
+    return rte_kni_handle_request(kni_port_params_array[port_id]->kni[0]);
+}
+
 int ff_mykni_alloc()
 {
 	uint8_t i = 0;
@@ -701,21 +707,37 @@ int ff_mykni_alloc()
 	struct rte_kni_conf conf;
     struct kni_port_params **params = kni_port_params_array;
     struct rte_kni_ops ops;
-    
+    if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
+        printf("rte_eal_process_type():%d != RTE_PROC_PRIMARY:%d\n", 
+        rte_eal_process_type(), RTE_PROC_PRIMARY);
+        return -1;
+    }
     snprintf(conf.name, RTE_KNI_NAMESIZE,
 					"moveth%u_%u", port_id, i);
-    //conf.min_mtu = 1000;//dev_info.min_mtu;
-	//conf.max_mtu = 1500;//dev_info.max_mtu;
+
+    rte_eth_dev_get_mtu(port_id, &conf.mtu);
+	//conf.min_mtu = dev_info.min_mtu;
+	//conf.max_mtu = dev_info.max_mtu;
+    conf.min_mtu = 1000;//dev_info.min_mtu;
+	conf.max_mtu = 1500;//dev_info.max_mtu;
     conf.group_id = port_id;
     //rte_eth_dev_get_mtu(port_id, &mtu);
     //conf.mbuf_size = mtu + KNI_ENET_HEADER_SIZE + KNI_ENET_FCS_SIZE;
     // if tso,maybe ptk will be drop in kernel becase mbuf_size too small, and show on dev stats tx_dropped
-	conf.mbuf_size = MAX_PACKET_SZ;conf.core_id = 1;//rte_lcore_id();
-	conf.force_bind = 1;
+	conf.mbuf_size = MAX_PACKET_SZ;
+    conf.core_id = rte_lcore_id();
+    printf("rte_lcore_id():%d, mtu:%u\n", rte_lcore_id(), conf.mtu);
+	conf.force_bind = 0;
+
+    /* Get the interface default mac address */
+    rte_eth_macaddr_get(port_id, (struct rte_ether_addr *)&conf.mac_addr);
 
     memset(&ops, 0, sizeof(ops));
-	ops.port_id = port_id;
-    
+    ops.port_id = port_id;
+    ops.change_mtu = kni_change_mtu;
+    ops.config_network_if = kni_config_network_interface;
+    ops.config_mac_address = kni_config_mac_address;
+
     kni = rte_kni_alloc(pktmbuf_pool[port_id], &conf, &ops);
     if (!kni)
         rte_exit(EXIT_FAILURE, "Fail to create kni for "
@@ -726,6 +748,10 @@ int ff_mykni_alloc()
 
 int ff_sendto_mykni_now(char *buf, int len) {
     struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+    if (!kni)
+        rte_exit(EXIT_FAILURE, "Fail to create kni for "
+                    "port: %d\n", port_id);
+
     int nb_kni_tx = 0;
     int num = 1;
     struct rte_mbuf *mb = NULL;
@@ -742,6 +768,7 @@ int ff_sendto_mykni_now(char *buf, int len) {
     mb->data_len = len;
 
     nb_kni_tx = rte_kni_tx_burst(kni, &mb, num);
+    //rte_kni_handle_request(kni); //do it in loop
     if (nb_kni_tx != num) {
         rte_pktmbuf_free(mb);
         kni_stats[port_id].rx_dropped += num;
@@ -822,6 +849,7 @@ int get_data_from_rxbuf(char *buf, int cap) {
         }
         if (mb->data_len > cap)
             return -1;
+
         rte_memcpy(buf, rte_pktmbuf_mtod(mb, char *), (size_t) mb->data_len);
         //rte_memcpy(buf, rte_pktmbuf_mtod_offset(mb, char *, 0), (size_t) mb->data_len);
         //rte_pktmbuf_data_len(m);
@@ -861,27 +889,59 @@ int ff_mykni_read(char *buf, int cap) {
 }
 
 int ff_mykni_read_multi(char **buf,int *data_len, int nb, int cap) {
-    int i, len;
-    int has_rx;
-    for(i = 0; i < nb; i++ ) {
-        if (!buf[i])
-            break;
+    int i;
+    struct rte_mbuf *mb = NULL;
+    struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+    
+    int try_rx = nb < sizeof(pkts_burst_rx) ? nb :sizeof(pkts_burst_rx);
+    int kni_rx_num = rte_kni_rx_burst(kni, pkts_burst_rx, try_rx);
+    for(i= 0;i < kni_rx_num;i++) {
+        mb = pkts_burst_rx[i];
+        if (!mb){
+            rte_exit(EXIT_FAILURE, "Could not be NULL, i:%d, kni_rx_num:%d\n", i, kni_rx_num);
+            return -1;
+        }
+        if (mb->data_len > cap)
+            continue;
 
+        rte_memcpy(buf, rte_pktmbuf_mtod(mb, char *), (size_t) mb->data_len);
+        data_len[i] = mb->data_len;
+
+        rte_pktmbuf_free(mb);
+        pkts_burst_rx[i] = NULL;
+    }
+    return kni_rx_num;
+}
+
+int ff_mykni_read_multi_with_buf(char **buf,int *data_len, int nb, int cap) {
+    int i, len;
+    int has_rx = 0;
+    struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+    for(i = 0; i < nb; i++ ) {
+        /*
+        if (!buf[i]) {
+            printf("i: %d\n", i);
+            break;
+        }
+        */
         len = get_data_from_rxbuf(buf[i], cap); 
         data_len[i] = len;
-        if (!len && !has_rx){
-            struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
+        if (!len && !has_rx) {          
             nb_rx = rte_kni_rx_burst(kni, pkts_burst_rx, sizeof(pkts_burst_rx));
-            if (nb_rx)
+            if (DEBUG && nb_rx) {
+                printf("rte_kni_rx_burst: %d\n", nb_rx);
+            }
+            if (nb_rx) {
                 len = get_data_from_rxbuf(buf[i], cap);
+                data_len[i] = len;
+            }
             has_rx = 1;
         }
         // still no data, break loop
         if (!len)
             break;      
     }
-
-    return i;
+    return i; //return package num
 }
 
 #define FDS_TABLE_SIZE_DEFAULT 16
@@ -944,7 +1004,8 @@ struct fd_node * get_node_by_mac(struct rte_ether_addr *mac) {
 }
 
 int get_fd_by_data(char *buf, int buf_len) {
-    if (sizeof(struct rte_ether_hdr) < buf_len) {
+    if (sizeof(struct rte_ether_hdr) > buf_len) {
+        printf("sizeof(struct rte_ether_hdr):%lu > buf_len:%d\n", sizeof(struct rte_ether_hdr), buf_len);
         return -1;
     }
 	struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)buf;
@@ -952,11 +1013,23 @@ int get_fd_by_data(char *buf, int buf_len) {
 }
 
 int learn_fd_mac(char *buf, int buf_len, int fd) {
-    if (sizeof(struct rte_ether_hdr) < buf_len) {
+    if (sizeof(struct rte_ether_hdr) > buf_len) {
+        printf("sizeof(struct rte_ether_hdr):%lu > buf_len:%d\n", sizeof(struct rte_ether_hdr), buf_len);
         return -1;
     }
     struct fd_node *node;
     struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)buf;    
+
+    if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) && 
+            eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+        printf("unknow ether_type:%04x\n", rte_cpu_to_be_16(eth_hdr->ether_type));
+        return -1;
+    }
+
+    if (!rte_is_unicast_ether_addr(&eth_hdr->s_addr)) {
+        print_ethaddr("src mac isn't unicast_ether_addr:", &eth_hdr->s_addr);
+        return -1;
+    }
 
     node = get_node_by_mac(&eth_hdr->s_addr);
     if (node) {
@@ -981,10 +1054,15 @@ int learn_fd_mac(char *buf, int buf_len, int fd) {
     //add to fds_table
     int hash = mac_hash(&eth_hdr->s_addr, fds_table_size-1);
     list_add(&node->list, &fds_table[hash]);
+
+    if (DEBUG) {
+        print_ethaddr("fdb, add node mac:", &node->mac);
+        printf("fd:%d\n", node->fd);       
+    }
     return 1;
 }
 
-#if 1
+#if 0
 //power of two
 struct iobuf {
     unsigned int head;
@@ -1161,7 +1239,7 @@ int read(struct iobuf *ib, char *buf, int len) {
     return get_data_len;
 }
 
-#else
+//#else
 struct iobuf {
     int head;
     int tail;

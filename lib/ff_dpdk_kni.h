@@ -59,6 +59,7 @@ int ff_kni_enqueue(uint16_t port_id, struct rte_mbuf *pkt);
 void ff_init_mykni(void);
 int ff_mykni_env();
 int ff_mykni_alloc();
+int ff_kni_handle_request();
 int ff_sendto_mykni_now(char *buf, int len);
 int ff_sendto_mykni(char *buf, int len);
 int ff_flush_mykni();
