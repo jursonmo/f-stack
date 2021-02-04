@@ -720,18 +720,25 @@ int ff_mykni_alloc()
 	//conf.max_mtu = dev_info.max_mtu;
     conf.min_mtu = 1000;//dev_info.min_mtu;
 	conf.max_mtu = 1500;//dev_info.max_mtu;
-    conf.group_id = port_id;
+    conf.group_id = port_id;//group_id for what?, not used in create kni dev 
     //rte_eth_dev_get_mtu(port_id, &mtu);
     //conf.mbuf_size = mtu + KNI_ENET_HEADER_SIZE + KNI_ENET_FCS_SIZE;
     // if tso,maybe ptk will be drop in kernel becase mbuf_size too small, and show on dev stats tx_dropped
 	conf.mbuf_size = MAX_PACKET_SZ;
-    conf.core_id = rte_lcore_id();
+    //if lcore_mask =1, lcore_id will be 0, if lcore_mask =2,lcore_id will be 1
+    conf.core_id = rte_lcore_id(); 
     printf("rte_lcore_id():%d, mtu:%u\n", rte_lcore_id(), conf.mtu);
-	conf.force_bind = 0;
+    //make kni kthread bind cpu core_id, so cpu cache will be ok? set lcore_mask in config.in
+	//cpu run dpdk app more than 10ms will be schedule to run kni kthread, so kni kthread to cpu bind is ok.
+    //如果想通过创建多个kni dev 来提高性能，那么后面的kni dev 就不要绑定到当前cpu了
+    //同时如果想启用kni kthread 多线程模式(每个kni dev分别启一个内核线程)，那么加载模块时就要参数kthread_mode=multiple
+    //多kni kthread 就是要把线程亲和到不同的cpu，也就是要设置好conf.core_id=xx, 同时conf.force_bind = 1,当然会出现cpu cache miss
+    conf.force_bind = 1;
 
     /* Get the interface default mac address */
     rte_eth_macaddr_get(port_id, (struct rte_ether_addr *)&conf.mac_addr);
 
+    // kni->req_q have events, will callback ops.xxxfunc
     memset(&ops, 0, sizeof(ops));
     ops.port_id = port_id;
     ops.change_mtu = kni_change_mtu;
@@ -888,7 +895,7 @@ int ff_mykni_read(char *buf, int cap) {
     return len;
 }
 
-int ff_mykni_read_multi(char **buf,int *data_len, int nb, int cap) {
+int ff_mykni_read_multi(char **buf, int data_off,int *data_len, int nb, int cap) {
     int i;
     struct rte_mbuf *mb = NULL;
     struct rte_kni *kni = kni_port_params_array[port_id]->kni[0];
@@ -901,10 +908,10 @@ int ff_mykni_read_multi(char **buf,int *data_len, int nb, int cap) {
             rte_exit(EXIT_FAILURE, "Could not be NULL, i:%d, kni_rx_num:%d\n", i, kni_rx_num);
             return -1;
         }
-        if (mb->data_len > cap)
+        if (mb->data_len > cap-data_off)
             continue;
 
-        rte_memcpy(buf, rte_pktmbuf_mtod(mb, char *), (size_t) mb->data_len);
+        rte_memcpy(buf+data_off, rte_pktmbuf_mtod(mb, char *), (size_t) mb->data_len);
         data_len[i] = mb->data_len;
 
         rte_pktmbuf_free(mb);
@@ -926,7 +933,7 @@ int ff_mykni_read_multi_with_buf(char **buf,int *data_len, int nb, int cap) {
         */
         len = get_data_from_rxbuf(buf[i], cap); 
         data_len[i] = len;
-        if (!len && !has_rx) {          
+        if (!len && !has_rx) {
             nb_rx = rte_kni_rx_burst(kni, pkts_burst_rx, sizeof(pkts_burst_rx));
             if (DEBUG && nb_rx) {
                 printf("rte_kni_rx_burst: %d\n", nb_rx);

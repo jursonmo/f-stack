@@ -87,7 +87,7 @@ int loop(void *arg)
 
     // get data from mykni
     //len = ff_mykni_read(buf_kni, PKT_SIZE);
-    nb = ff_mykni_read_multi(buf_kni_burst, data_len, PKT_BURST, PKT_SIZE);
+    nb = ff_mykni_read_multi(buf_kni_burst, 0, data_len, PKT_BURST, PKT_SIZE);
     if (DEBUG && nb) {
         printf("----read from kni dev, pkg:%d\n", nb);
     }
